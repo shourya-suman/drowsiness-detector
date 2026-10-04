@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Driver Drowsiness Detector</title>
+<meta name="description" content="Real-time driver drowsiness and distraction alarm that runs entirely in your browser using any device's camera.">
+<style>
+  :root {
+    --bg: #0f172a;
+    --surface: #1e293b;
+    --border: #334155;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --danger: #f87171;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 24px 16px 48px;
+  }
+  h1 { font-size: 1.4rem; font-weight: 700; text-align: center; }
+  p.sub { color: var(--muted); font-size: 0.9rem; margin-top: 6px; text-align: center; }
+  .stage {
+    position: relative;
+    width: min(640px, 100%);
+    aspect-ratio: 4 / 3;
+    margin-top: 20px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    overflow: hidden;
+  }
+  video, canvas {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    transform: scaleX(-1); /* mirror for natural selfie view */
+  }
+  .stage.alert {
+    border-color: var(--danger);
+    box-shadow: 0 0 0 4px rgba(248, 113, 113, 0.35);
+    animation: pulse 0.7s ease-in-out infinite alternate;
+  }
+  @keyframes pulse {
+    from { box-shadow: 0 0 0 4px rgba(248,113,113,0.25); }
+    to   { box-shadow: 0 0 0 12px rgba(248,113,113,0.55); }
+  }
+  .banner {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    padding: 8px 16px; border-radius: 999px;
+    font-weight: 700; font-size: 0.9rem;
+    background: rgba(15,23,42,0.8); color: var(--muted);
+    border: 1px solid var(--border);
+    white-space: nowrap; z-index: 3;
+  }
+  .banner.ok    { color: var(--ok); }
+  .banner.warn  { color: var(--warn); }
+  .banner.danger{ color: var(--danger); border-color: var(--danger); }
+  .metrics {
+    display: flex; gap: 10px; flex-wrap: wrap; justify-content: center;
+    margin-top: 16px; width: min(640px, 100%);
+  }
+  .metric {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 10px 14px; min-width: 130px; text-align: center;
+  }
+  .metric .label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+  .metric .value { font-size: 1.15rem; font-weight: 700; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  #startBtn {
+    margin-top: 24px; padding: 14px 28px; font-size: 1rem; font-weight: 700;
+    border: none; border-radius: 12px; cursor: pointer;
+    background: var(--accent); color: #082f49;
+  }
+  #startBtn:disabled { opacity: 0.5; cursor: wait; }
+  .note { color: var(--muted); font-size: 0.8rem; margin-top: 14px; max-width: 640px; text-align: center; line-height: 1.5; }
+  .footer { color: var(--muted); font-size: 0.75rem; margin-top: 24px; }
+</style>
+</head>
+<body>
+  <h1>Driver Drowsiness &amp; Distraction Alert</h1>
+  <p class="sub">Runs 100% in your browser — video never leaves your device.</p>
+
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="overlay"></canvas>
+    <div class="banner" id="banner">Camera off</div>
+  </div>
+
+  <div class="metrics">
+    <div class="metric"><div class="label">Eyes</div><div class="value" id="eyeState">—</div></div>
+    <div class="metric"><div class="label">Eye closed</div><div class="value" id="eyeTimer">0.0s</div></div>
+    <div class="metric"><div class="label">Looking away</div><div class="value" id="awayTimer">0.0s</div></div>
+    <div class="metric"><div class="label">Alerts</div><div class="value" id="alertCount">0</div></div>
+  </div>
+
+  <button id="startBtn">Start camera</button>
+  <p class="note">
+    Calibrates automatically: look straight ahead for the first ~3 seconds.
+    An alarm sounds if your eyes stay closed or you look away for more than
+    2 seconds. Press <b>R</b> to recalibrate after changing seating position.
+    Works best in good lighting with your face clearly visible.
+  </p>
+  <div class="footer">No video is uploaded or stored — all processing happens on this device.</div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver } from
+  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+// ---- Tunables -----------------------------------------------------------
+const CLOSED_TIME_LIMIT_S = 2.0;   // eyes closed before alarm
+const AWAY_TIME_LIMIT_S   = 2.0;   // looking away before alarm
+const CALIBRATION_FRAMES  = 90;    // ~3 s at 30 fps
+const CLOSED_RATIO        = 0.72;  // closed when EAR < baseline * this
+const YAW_TOLERANCE       = 1.9;   // multiplied by calibrated yaw jitter
+const PITCH_TOLERANCE     = 1.9;
+
+// MediaPipe FaceMesh landmark index groups
+const LEFT_EYE  = [33, 160, 158, 133, 153, 144];
+const RIGHT_EYE = [362, 385, 387, 263, 373, 380];
+const NOSE_TIP = 1, CHIN = 152, L_CHEEK = 234, R_CHEEK = 454,
+      FOREHEAD = 10;
+
+// ---- DOM ---------------------------------------------------------------
+const video    = document.getElementById("video");
+const canvas   = document.getElementById("overlay");
+const ctx      = canvas.getContext("2d");
+const stage    = document.getElementById("stage");
+const banner   = document.getElementById("banner");
+const startBtn = document.getElementById("startBtn");
+const eyeStateEl  = document.getElementById("eyeState");
+const eyeTimerEl  = document.getElementById("eyeTimer");
+const awayTimerEl = document.getElementById("awayTimer");
+const alertCountEl= document.getElementById("alertCount");
+
+// ---- State --------------------------------------------------------------
+let landmarker = null;
+let running = false;
+let lastVideoTime = -1;
+let calibFrames = [];
+let calibYaw = [], calibPitch = [];
+let eyeClosedStart = null;
+let lookAwayStart = null;
+let alarmActive = false;
+let alertCount = 0;
+let lastBeepAt = 0;
+let audioCtx = null;
+
+// ---- Helpers ------------------------------------------------------------
+function dist(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+// Eye Aspect Ratio (EAR), same formula as the desktop Python version
+function ear(landmarks, idx) {
+  const p = idx.map(i => landmarks[i]);
+  const horiz = dist(p[0], p[3]);
+  const vert = (dist(p[1], p[5]) + dist(p[2], p[4])) / 2;
+  return horiz === 0 ? 0 : vert / horiz;
+}
+
+// Normalised head-turn proxies (scale-invariant)
+function headPose(landmarks) {
+  const faceW = dist(landmarks[L_CHEEK], landmarks[R_CHEEK]) || 1e-6;
+  const faceH = dist(landmarks[FOREHEAD], landmarks[CHIN]) || 1e-6;
+  const nose = landmarks[NOSE_TIP];
+  const cx = (landmarks[L_CHEEK].x + landmarks[R_CHEEK].x) / 2;
+  const cy = (landmarks[FOREHEAD].y + landmarks[CHIN].y) / 2;
+  return {
+    yaw:   (nose.x - cx) / faceW,
+    pitch: (nose.y - cy) / faceH,
+  };
+}
+
+function median(arr) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+}
+
+// ---- Alarm ---------------------------------------------------------------
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") audioCtx.resume();
+}
+function beep() {
+  const now = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = "square";
+  osc.frequency.value = 880;
+  gain.gain.setValueAtTime(0.001, now);
+  gain.gain.exponentialRampToValueAtTime(0.35, now + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.001, now + 0.45);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(now);
+  osc.stop(now + 0.5);
+}
+function triggerAlarm(reason) {
+  if (!alarmActive) {
+    alarmActive = true;
+    alertCount++;
+    alertCountEl.textContent = alertCount;
+    if (navigator.vibrate) navigator.vibrate([300, 150, 300]);
+  }
+  banner.textContent = "WAKE UP — " + reason;
+  banner.className = "banner danger";
+  stage.classList.add("alert");
+  const t = performance.now();
+  if (t - lastBeepAt > 600) { beep(); lastBeepAt = t; }
+}
+function clearAlarm() {
+  alarmActive = false;
+  stage.classList.remove("alert");
+}
+
+// ---- Main loop ------------------------------------------------------------
+function drawOverlay(landmarks) {
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  if (!landmarks) return;
+  // Because CSS mirrors both video and canvas, draw in un-mirrored video
+  // coordinates and the mirrored CSS display lines up.
+  ctx.fillStyle = "rgba(56,189,248,0.9)";
+  for (const i of [...LEFT_EYE, ...RIGHT_EYE]) {
+    const p = landmarks[i];
+    ctx.beginPath();
+    ctx.arc(p.x * w, p.y * h, Math.max(2, w * 0.004), 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+async function loop() {
+  if (!running) return;
+
+  if (video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const result = landmarker.detectForVideo(video, performance.now());
+    const lm = result.faceLandmarks && result.faceLandmarks[0];
+
+    drawOverlay(lm);
+
+    if (lm) {
+      const l = ear(lm, LEFT_EYE);
+      const r = ear(lm, RIGHT_EYE);
+      const e = (l + r) / 2;
+      const pose = headPose(lm);
+
+      if (calibFrames.length < CALIBRATION_FRAMES) {
+        // ---- calibration phase ----
+        calibFrames.push(e);
+        calibYaw.push(pose.yaw);
+        calibPitch.push(pose.pitch);
+        const pct = Math.round((calibFrames.length / CALIBRATION_FRAMES) * 100);
+        banner.textContent = "Calibrating — look straight ahead " + pct + "%";
+        banner.className = "banner warn";
+        eyeStateEl.textContent = "…";
+      } else {
+        // ---- detection phase ----
+        const earBase = median(calibFrames);
+        const yawBase = median(calibYaw);
+        const pitchBase = median(calibPitch);
+        const yawJit = Math.max(0.01,
+          median(calibYaw.map(v => Math.abs(v - yawBase))));
+        const pitchJit = Math.max(0.01,
+          median(calibPitch.map(v => Math.abs(v - pitchBase))));
+
+        const eyesClosed = e < earBase * CLOSED_RATIO;
+        const turnedAway =
+          Math.abs(pose.yaw - yawBase) > yawJit * YAW_TOLERANCE ||
+          Math.abs(pose.pitch - pitchBase) > pitchJit * PITCH_TOLERANCE;
+
+        const now = performance.now();
+        eyeStateEl.textContent = eyesClosed ? "CLOSED" : "Open";
+
+        // eyes-closed timer
+        if (eyesClosed) {
+          eyeClosedStart ??= now;
+          const s = (now - eyeClosedStart) / 1000;
+          eyeTimerEl.textContent = s.toFixed(1) + "s";
+          if (s >= CLOSED_TIME_LIMIT_S) triggerAlarm("eyes closed!");
+        } else {
+          eyeClosedStart = null;
+          eyeTimerEl.textContent = "0.0s";
+        }
+
+        // looking-away timer
+        if (turnedAway) {
+          lookAwayStart ??= now;
+          const s = (now - lookAwayStart) / 1000;
+          awayTimerEl.textContent = s.toFixed(1) + "s";
+          if (s >= AWAY_TIME_LIMIT_S) triggerAlarm("eyes on the road!");
+        } else {
+          lookAwayStart = null;
+          awayTimerEl.textContent = "0.0s";
+        }
+
+        if (!alarmActive) {
+          if (eyesClosed || turnedAway) {
+            banner.textContent = eyesClosed ? "Eyes closing…" : "Keep eyes on the road";
+            banner.className = "banner warn";
+          } else {
+            banner.textContent = "Monitoring";
+            banner.className = "banner ok";
+          }
+        }
+      }
+    } else {
+      // no face found
+      eyeStateEl.textContent = "No face";
+      if (!alarmActive) {
+        banner.textContent = calibFrames.length < CALIBRATION_FRAMES
+          ? "Calibrating — no face detected, sit in front of the camera"
+          : "No face detected — sit in front of the camera";
+        banner.className = "banner warn";
+      }
+      eyeClosedStart = null;
+      lookAwayStart = null;
+      eyeTimerEl.textContent = "0.0s";
+      awayTimerEl.textContent = "0.0s";
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+// ---- Start ----------------------------------------------------------------
+async function start() {
+  startBtn.disabled = true;
+  startBtn.textContent = "Loading model…";
+  try {
+    ensureAudio();
+
+    if (!landmarker) {
+      const fileset = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+      landmarker = await FaceLandmarker.createFromOptions(fileset, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+          delegate: "GPU",
+        },
+        runningMode: "VIDEO",
+        numFaces: 1,
+      });
+    }
+
+    startBtn.textContent = "Requesting camera…";
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+
+    calibFrames = []; calibYaw = []; calibPitch = [];
+    eyeClosedStart = null; lookAwayStart = null;
+    running = true;
+    startBtn.style.display = "none";
+    requestAnimationFrame(loop);
+  } catch (err) {
+    banner.textContent = err && err.name === "NotAllowedError"
+      ? "Camera permission denied"
+      : "Could not start: " + (err.message || err.name);
+    banner.className = "banner danger";
+    startBtn.disabled = false;
+    startBtn.textContent = "Try again";
+  }
+}
+
+startBtn.addEventListener("click", start);
+
+document.addEventListener("keydown", (e) => {
+  if (e.key.toLowerCase() === "r" && running) {
+    calibFrames = []; calibYaw = []; calibPitch = [];
+    clearAlarm();
+    banner.textContent = "Recalibrating — look straight ahead";
+    banner.className = "banner warn";
+  }
+});
+
+// stop the alarm timers if the page is hidden (e.g. tab switched)
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    eyeClosedStart = null; lookAwayStart = null; clearAlarm();
+  }
+});
+</script>
+</body>
+</html>
